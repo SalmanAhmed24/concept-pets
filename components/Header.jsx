@@ -1,9 +1,11 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useCart } from '@/lib/CartContext';
 
 export default function Header() {
   const [scrolled, setScrolled] = useState(false);
+  const { count, openCart } = useCart();
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 24);
@@ -27,7 +29,13 @@ export default function Header() {
             <li><a href="#reviews">Reviews</a></li>
           </ul>
         </nav>
-        <a className="btn btn-butter" href="#book">Book a groom</a>
+        <div className="nav-actions">
+          <button className="cart-btn" onClick={openCart} aria-label={`Open cart, ${count} items`}>
+            🧺
+            {count > 0 && <span className="cart-count" aria-hidden="true">{count}</span>}
+          </button>
+          <a className="btn btn-butter" href="#book">Book a groom</a>
+        </div>
       </div>
     </header>
   );

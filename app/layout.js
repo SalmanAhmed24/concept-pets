@@ -1,4 +1,6 @@
 import './globals.css';
+import { CartProvider } from '@/lib/CartContext';
+import CartDrawer from '@/components/CartDrawer';
 
 export const metadata = {
   title: 'Suds & Snouts — Serious grooming for very unserious animals',
@@ -23,7 +25,12 @@ export default function RootLayout({ children }) {
           rel="stylesheet"
         />
       </head>
-      <body>{children}</body>
+      <body>
+        <CartProvider>
+          {children}
+          <CartDrawer />
+        </CartProvider>
+      </body>
     </html>
   );
 }

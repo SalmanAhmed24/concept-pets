@@ -1,0 +1,948 @@
+From 448e28c41f7096197164bdc58d23c150c04ec8af Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 10 Jul 2026 05:00:10 +0000
+Subject: [PATCH] Add ecommerce: cart, checkout, and Stripe payment flow
+
+- Cart context with localStorage persistence, qty controls, slide-out drawer
+- Add-to-cart buttons on service cards; cart badge in header
+- /checkout page with customer form and order summary
+- /api/checkout route creating Stripe Checkout Sessions with
+  server-side price lookup (client can never set prices)
+- Demo mode when STRIPE_SECRET_KEY is unset so the flow works
+  out of the box; /checkout/success confirmation page
+- Styles matching the existing neo-brutalist design system
+---
+ .env.example                   |   9 ++
+ app/api/checkout/route.js      |  95 ++++++++++++++++++++
+ app/checkout/page.js           | 130 +++++++++++++++++++++++++++
+ app/checkout/success/page.js   |  49 ++++++++++
+ app/globals.css                | 159 +++++++++++++++++++++++++++++++++
+ app/layout.js                  |   9 +-
+ components/AddToCartButton.jsx |  23 +++++
+ components/CartDrawer.jsx      |  99 ++++++++++++++++++++
+ components/Header.jsx          |  10 ++-
+ components/Sections.jsx        |   6 +-
+ lib/CartContext.jsx            |  89 ++++++++++++++++++
+ lib/data.js                    |  12 +++
+ package-lock.json              |  22 ++++-
+ package.json                   |   3 +-
+ 14 files changed, 708 insertions(+), 7 deletions(-)
+ create mode 100644 .env.example
+ create mode 100644 app/api/checkout/route.js
+ create mode 100644 app/checkout/page.js
+ create mode 100644 app/checkout/success/page.js
+ create mode 100644 components/AddToCartButton.jsx
+ create mode 100644 components/CartDrawer.jsx
+ create mode 100644 lib/CartContext.jsx
+
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..1c71099
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,9 @@
++# Stripe secret key (starts with sk_test_ or sk_live_).
++# Get one at https://dashboard.stripe.com/apikeys
++# If unset, checkout runs in demo mode: no payment is taken and the
++# user is sent straight to the order-confirmation page.
++STRIPE_SECRET_KEY=
++
++# Public site URL used for payment redirect links (optional; the
++# request origin is used when available).
++NEXT_PUBLIC_SITE_URL=http://localhost:3000
+diff --git a/app/api/checkout/route.js b/app/api/checkout/route.js
+new file mode 100644
+index 0000000..03c64cc
+--- /dev/null
++++ b/app/api/checkout/route.js
+@@ -0,0 +1,95 @@
++import { NextResponse } from 'next/server';
++import { SERVICES } from '@/lib/data';
++
++/**
++ * POST /api/checkout
++ * Body: { customer: { name, email, petName, notes }, items: [{ id, qty }] }
++ *
++ * Prices are always looked up server-side from lib/data.js by service id,
++ * so a tampered client can never set its own prices.
++ *
++ * With STRIPE_SECRET_KEY set, this creates a real Stripe Checkout Session
++ * and returns its hosted payment URL. Without it, the route runs in demo
++ * mode and returns the success page URL directly so the flow can be
++ * exercised end-to-end in development.
++ */
++export async function POST(request) {
++  let body;
++  try {
++    body = await request.json();
++  } catch {
++    return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
++  }
++
++  const { customer, items } = body || {};
++
++  if (!Array.isArray(items) || items.length === 0) {
++    return NextResponse.json({ error: 'Your cart is empty' }, { status: 400 });
++  }
++  if (!customer?.email || !customer?.name) {
++    return NextResponse.json({ error: 'Name and email are required' }, { status: 400 });
++  }
++
++  // Resolve items against the server-side catalogue
++  const lineItems = [];
++  for (const { id, qty } of items) {
++    const service = SERVICES.find((s) => s.id === id);
++    const quantity = Number.parseInt(qty, 10);
++    if (!service || !Number.isFinite(quantity) || quantity < 1 || quantity > 20) {
++      return NextResponse.json({ error: `Invalid cart item: ${id}` }, { status: 400 });
++    }
++    lineItems.push({ service, quantity });
++  }
++
++  const origin =
++    request.headers.get('origin') ||
++    process.env.NEXT_PUBLIC_SITE_URL ||
++    'http://localhost:3000';
++
++  const secretKey = process.env.STRIPE_SECRET_KEY;
++
++  // ---- Demo mode (no Stripe key configured) ----
++  if (!secretKey) {
++    const total = lineItems.reduce((n, li) => n + li.service.amount * li.quantity, 0);
++    return NextResponse.json({
++      url: `${origin}/checkout/success?demo=1&total=${total.toFixed(2)}`,
++    });
++  }
++
++  // ---- Real Stripe Checkout ----
++  try {
++    const { default: Stripe } = await import('stripe');
++    const stripe = new Stripe(secretKey);
++
++    const session = await stripe.checkout.sessions.create({
++      mode: 'payment',
++      customer_email: customer.email,
++      line_items: lineItems.map(({ service, quantity }) => ({
++        quantity,
++        price_data: {
++          currency: 'usd',
++          unit_amount: Math.round(service.amount * 100),
++          product_data: {
++            name: service.title,
++            description: service.body,
++          },
++        },
++      })),
++      metadata: {
++        customer_name: String(customer.name).slice(0, 500),
++        pet_name: String(customer.petName || '').slice(0, 500),
++        notes: String(customer.notes || '').slice(0, 500),
++      },
++      success_url: `${origin}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
++      cancel_url: `${origin}/checkout`,
++    });
++
++    return NextResponse.json({ url: session.url });
++  } catch (err) {
++    console.error('Stripe checkout error:', err);
++    return NextResponse.json(
++      { error: 'Could not start payment. Please try again.' },
++      { status: 500 }
++    );
++  }
++}
+diff --git a/app/checkout/page.js b/app/checkout/page.js
+new file mode 100644
+index 0000000..85c284f
+--- /dev/null
++++ b/app/checkout/page.js
+@@ -0,0 +1,130 @@
++'use client';
++
++import { useState } from 'react';
++import Link from 'next/link';
++import { useRouter } from 'next/navigation';
++import { useCart, formatMoney } from '@/lib/CartContext';
++
++export default function CheckoutPage() {
++  const { items, subtotal } = useCart();
++  const router = useRouter();
++  const [form, setForm] = useState({ name: '', email: '', petName: '', notes: '' });
++  const [status, setStatus] = useState('idle'); // idle | submitting | error
++  const [error, setError] = useState('');
++
++  const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
++
++  async function handleSubmit(e) {
++    e.preventDefault();
++    if (items.length === 0) return;
++    setStatus('submitting');
++    setError('');
++    try {
++      const res = await fetch('/api/checkout', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          customer: form,
++          items: items.map(({ id, qty }) => ({ id, qty })),
++        }),
++      });
++      const data = await res.json();
++      if (!res.ok) throw new Error(data.error || 'Checkout failed');
++      if (data.url) {
++        // Stripe-hosted payment page (or demo success page)
++        window.location.assign(data.url);
++      } else {
++        router.push('/checkout/success');
++      }
++    } catch (err) {
++      setStatus('error');
++      setError(err.message || 'Something went wrong. Please try again.');
++    }
++  }
++
++  return (
++    <main className="checkout-page section-pad">
++      <div className="wrap checkout-wrap">
++        <div className="section-head">
++          <div>
++            <span className="kicker">Almost there</span>
++            <h1>Checkout</h1>
++          </div>
++          <p>
++            Tell us who&apos;s coming in and settle up. Payment is handled securely — we never see
++            your card details.
++          </p>
++        </div>
++
++        {items.length === 0 ? (
++          <div className="checkout-empty">
++            <p>Your cart is empty — go pick a treatment first. 🐾</p>
++            <Link className="btn btn-butter" href="/#services">
++              Back to services
++            </Link>
++          </div>
++        ) : (
++          <div className="checkout-grid">
++            <form className="checkout-form" onSubmit={handleSubmit}>
++              <label>
++                Your name
++                <input required value={form.name} onChange={set('name')} placeholder="Sam Whiskers" />
++              </label>
++              <label>
++                Email
++                <input
++                  required
++                  type="email"
++                  value={form.email}
++                  onChange={set('email')}
++                  placeholder="you@example.com"
++                />
++              </label>
++              <label>
++                Pet&apos;s name
++                <input required value={form.petName} onChange={set('petName')} placeholder="Biscuit" />
++              </label>
++              <label>
++                Notes for the groomer (optional)
++                <textarea
++                  rows={3}
++                  value={form.notes}
++                  onChange={set('notes')}
++                  placeholder="Dramatic about nail trims, motivated by cheese."
++                />
++              </label>
++
++              {status === 'error' && <p className="checkout-error" role="alert">{error}</p>}
++
++              <button className="btn btn-pink checkout-pay-btn" disabled={status === 'submitting'}>
++                {status === 'submitting' ? 'Taking you to payment…' : `Pay ${formatMoney(subtotal)}`}
++              </button>
++              <p className="checkout-secure">🔒 Secured by Stripe Checkout</p>
++            </form>
++
++            <aside className="order-summary" aria-label="Order summary">
++              <h2>Order summary</h2>
++              <ul>
++                {items.map((item) => (
++                  <li key={item.id}>
++                    <span>
++                      {item.icon} {item.title} × {item.qty}
++                    </span>
++                    <span>{formatMoney(item.amount * item.qty)}</span>
++                  </li>
++                ))}
++              </ul>
++              <div className="order-total">
++                <span>Total</span>
++                <strong>{formatMoney(subtotal)}</strong>
++              </div>
++              <Link href="/#services" className="order-edit">
++                ← Keep shopping
++              </Link>
++            </aside>
++          </div>
++        )}
++      </div>
++    </main>
++  );
++}
+diff --git a/app/checkout/success/page.js b/app/checkout/success/page.js
+new file mode 100644
+index 0000000..6a1fff6
+--- /dev/null
++++ b/app/checkout/success/page.js
+@@ -0,0 +1,49 @@
++'use client';
++
++import { Suspense, useEffect } from 'react';
++import Link from 'next/link';
++import { useSearchParams } from 'next/navigation';
++import { useCart } from '@/lib/CartContext';
++
++function SuccessContent() {
++  const { clearCart } = useCart();
++  const params = useSearchParams();
++  const isDemo = params.get('demo') === '1';
++  const total = params.get('total');
++
++  // Payment finished — empty the cart
++  useEffect(() => {
++    clearCart();
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++
++  return (
++    <main className="success-page section-pad">
++      <div className="wrap success-wrap">
++        <span className="success-emoji" aria-hidden="true">🎉🐾</span>
++        <h1>Order confirmed!</h1>
++        <p>
++          You&apos;re booked in. A confirmation email is on its way — we&apos;ll see you (and the
++          floof) soon. The goodbye treat is already set aside.
++        </p>
++        {isDemo && (
++          <p className="demo-note">
++            Demo mode: no payment was actually taken{total ? ` (order total $${total})` : ''}. Set{' '}
++            <code>STRIPE_SECRET_KEY</code> to enable real payments.
++          </p>
++        )}
++        <Link className="btn btn-butter" href="/">
++          Back to Suds &amp; Snouts
++        </Link>
++      </div>
++    </main>
++  );
++}
++
++export default function SuccessPage() {
++  return (
++    <Suspense fallback={null}>
++      <SuccessContent />
++    </Suspense>
++  );
++}
+diff --git a/app/globals.css b/app/globals.css
+index c4e0e5c..b809eef 100644
+--- a/app/globals.css
++++ b/app/globals.css
+@@ -383,3 +383,162 @@
+     .marquee-track{animation:none;}
+     *,*::before,*::after{transition-duration:.01ms !important;animation-duration:.01ms !important;}
+   }
++
++  /* ---------- ecommerce: service card footer ---------- */
++  .svc-card-foot{
++    display:flex;align-items:center;justify-content:space-between;
++    gap:.8rem;margin-top:1.2rem;flex-wrap:wrap;
++  }
++  .svc-card-foot .price{margin-top:0;}
++  .btn-add{
++    background:var(--ink);color:var(--white);
++    border:none;cursor:pointer;font-family:var(--body);font-weight:700;
++    font-size:.85rem;padding:.55rem 1rem;border-radius:999px;
++    box-shadow:0 3px 0 rgba(27,7,51,.35);
++    transition:transform .15s ease, background .2s ease;
++  }
++  .btn-add:hover{transform:translateY(-2px);background:var(--violet);}
++  .btn-add:active{transform:translateY(1px);}
++
++  /* ---------- ecommerce: header cart button ---------- */
++  .nav-actions{display:flex;align-items:center;gap:.8rem;}
++  .cart-btn{
++    position:relative;width:44px;height:44px;border-radius:50%;
++    background:var(--white);border:3px solid var(--ink);cursor:pointer;
++    display:grid;place-items:center;font-size:1.15rem;
++    box-shadow:0 3px 0 rgba(27,7,51,.35);
++    transition:transform .15s ease;
++  }
++  .cart-btn:hover{transform:translateY(-2px) rotate(-4deg);}
++  .cart-count{
++    position:absolute;top:-6px;right:-6px;min-width:20px;height:20px;
++    border-radius:999px;background:var(--pink);color:var(--white);
++    font-size:.7rem;font-weight:800;display:grid;place-items:center;
++    padding:0 4px;border:2px solid var(--ink);
++  }
++
++  /* ---------- ecommerce: cart drawer ---------- */
++  .cart-overlay{
++    position:fixed;inset:0;background:rgba(27,7,51,.5);z-index:180;
++    opacity:0;pointer-events:none;transition:opacity .25s ease;
++  }
++  .cart-overlay.open{opacity:1;pointer-events:auto;}
++  .cart-drawer{
++    position:fixed;top:0;right:0;bottom:0;z-index:190;
++    width:min(420px, 92vw);background:var(--milk);
++    border-left:3px solid var(--ink);
++    display:flex;flex-direction:column;
++    transform:translateX(105%);transition:transform .3s cubic-bezier(.22,1,.36,1);
++  }
++  .cart-drawer.open{transform:translateX(0);}
++  .cart-head{
++    display:flex;align-items:center;justify-content:space-between;
++    padding:1.3rem 1.5rem;border-bottom:3px solid var(--ink);
++  }
++  .cart-head h2{font-family:var(--display);font-size:1.15rem;}
++  .cart-close{
++    width:38px;height:38px;border-radius:50%;background:var(--white);
++    border:3px solid var(--ink);cursor:pointer;font-size:1rem;font-weight:700;
++    box-shadow:2px 2px 0 var(--ink);
++  }
++  .cart-empty{
++    flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
++    gap:1rem;padding:2rem;text-align:center;
++  }
++  .cart-empty span{font-size:2.4rem;}
++  .cart-items{list-style:none;flex:1;overflow-y:auto;padding:1rem 1.5rem;}
++  .cart-item{
++    display:flex;gap:.9rem;align-items:flex-start;
++    background:var(--white);border:3px solid var(--ink);border-radius:var(--radius-md);
++    padding:1rem;margin-bottom:.9rem;box-shadow:3px 3px 0 var(--ink);
++  }
++  .cart-item-icon{font-size:1.6rem;}
++  .cart-item-info{flex:1;display:flex;flex-direction:column;gap:.25rem;}
++  .cart-item-info strong{font-size:.95rem;}
++  .cart-item-price{font-size:.85rem;opacity:.7;}
++  .qty-controls{display:flex;align-items:center;gap:.6rem;margin-top:.3rem;}
++  .qty-controls button{
++    width:26px;height:26px;border-radius:50%;border:2px solid var(--ink);
++    background:var(--butter);cursor:pointer;font-weight:800;line-height:1;
++  }
++  .qty-controls span{font-weight:700;min-width:1.2rem;text-align:center;}
++  .cart-item-end{display:flex;flex-direction:column;align-items:flex-end;gap:.4rem;}
++  .cart-line-total{font-family:var(--display);font-weight:700;font-size:.9rem;}
++  .cart-remove{
++    background:none;border:none;cursor:pointer;font-size:.75rem;
++    color:var(--pink);font-weight:700;text-decoration:underline;padding:0;
++  }
++  .cart-foot{padding:1.3rem 1.5rem;border-top:3px solid var(--ink);background:var(--white);}
++  .cart-subtotal{
++    display:flex;justify-content:space-between;font-size:1.05rem;margin-bottom:.3rem;
++  }
++  .cart-subtotal strong{font-family:var(--display);}
++  .cart-note{font-size:.85rem;opacity:.7;margin-bottom:1rem;}
++  .cart-checkout-btn{display:block;text-align:center;text-decoration:none;}
++
++  /* ---------- ecommerce: checkout page ---------- */
++  .checkout-page{padding-top:8rem;min-height:100vh;}
++  .checkout-page h1{font-family:var(--display);font-size:clamp(2rem,4vw,3rem);}
++  .checkout-grid{
++    display:grid;grid-template-columns:1.4fr 1fr;gap:2rem;align-items:start;
++  }
++  .checkout-form{
++    display:flex;flex-direction:column;gap:1.1rem;
++    background:var(--white);border:3px solid var(--ink);border-radius:var(--radius-lg);
++    padding:2rem;box-shadow:0 8px 0 var(--ink);
++  }
++  .checkout-form label{
++    display:flex;flex-direction:column;gap:.4rem;font-weight:700;font-size:.9rem;
++  }
++  .checkout-form input,
++  .checkout-form textarea{
++    font-family:var(--body);font-size:1rem;padding:.75rem .9rem;
++    border:2px solid var(--ink);border-radius:12px;background:var(--milk);
++    resize:vertical;
++  }
++  .checkout-form input:focus,
++  .checkout-form textarea:focus{outline:3px solid var(--butter);outline-offset:2px;}
++  .checkout-pay-btn{border:none;cursor:pointer;font-size:1rem;margin-top:.4rem;}
++  .checkout-pay-btn:disabled{opacity:.6;cursor:wait;}
++  .checkout-secure{font-size:.8rem;text-align:center;opacity:.65;}
++  .checkout-error{
++    background:#FFE3EC;border:2px solid var(--pink);color:var(--ink);
++    border-radius:12px;padding:.7rem 1rem;font-size:.9rem;font-weight:600;
++  }
++  .checkout-empty{
++    display:flex;flex-direction:column;align-items:flex-start;gap:1.2rem;
++    font-size:1.05rem;
++  }
++  .order-summary{
++    background:var(--butter);border:3px solid var(--ink);border-radius:var(--radius-lg);
++    padding:1.8rem;box-shadow:0 8px 0 var(--ink);position:sticky;top:7rem;
++  }
++  .order-summary h2{font-family:var(--display);font-size:1.1rem;margin-bottom:1rem;}
++  .order-summary ul{list-style:none;display:flex;flex-direction:column;gap:.6rem;}
++  .order-summary li{display:flex;justify-content:space-between;gap:1rem;font-size:.92rem;}
++  .order-total{
++    display:flex;justify-content:space-between;margin-top:1.1rem;padding-top:1rem;
++    border-top:2px dashed var(--ink);font-size:1.05rem;
++  }
++  .order-total strong{font-family:var(--display);}
++  .order-edit{display:inline-block;margin-top:1rem;font-size:.85rem;font-weight:700;}
++
++  /* ---------- ecommerce: success page ---------- */
++  .success-page{padding-top:9rem;min-height:100vh;}
++  .success-wrap{
++    max-width:620px;text-align:center;display:flex;flex-direction:column;
++    align-items:center;gap:1.2rem;
++  }
++  .success-emoji{font-size:3rem;}
++  .success-page h1{font-family:var(--display);font-size:clamp(2rem,4vw,3rem);}
++  .success-page p{line-height:1.6;}
++  .demo-note{
++    background:var(--white);border:2px dashed var(--ink);border-radius:12px;
++    padding:.8rem 1.1rem;font-size:.88rem;
++  }
++  .demo-note code{background:var(--milk);padding:.1rem .35rem;border-radius:6px;}
++
++  @media (max-width: 800px){
++    .checkout-grid{grid-template-columns:1fr;}
++    .order-summary{position:static;order:-1;}
++  }
+diff --git a/app/layout.js b/app/layout.js
+index 892dfba..19151f0 100644
+--- a/app/layout.js
++++ b/app/layout.js
+@@ -1,4 +1,6 @@
+ import './globals.css';
++import { CartProvider } from '@/lib/CartContext';
++import CartDrawer from '@/components/CartDrawer';
+ 
+ export const metadata = {
+   title: 'Suds & Snouts — Serious grooming for very unserious animals',
+@@ -23,7 +25,12 @@ export default function RootLayout({ children }) {
+           rel="stylesheet"
+         />
+       </head>
+-      <body>{children}</body>
++      <body>
++        <CartProvider>
++          {children}
++          <CartDrawer />
++        </CartProvider>
++      </body>
+     </html>
+   );
+ }
+diff --git a/components/AddToCartButton.jsx b/components/AddToCartButton.jsx
+new file mode 100644
+index 0000000..7558fab
+--- /dev/null
++++ b/components/AddToCartButton.jsx
+@@ -0,0 +1,23 @@
++'use client';
++
++import { useCart } from '@/lib/CartContext';
++
++export default function AddToCartButton({ service }) {
++  const { addItem } = useCart();
++  return (
++    <button
++      className="btn btn-add"
++      onClick={() =>
++        addItem({
++          id: service.id,
++          title: service.title,
++          amount: service.amount,
++          icon: service.icon,
++        })
++      }
++      aria-label={`Add ${service.title} to cart`}
++    >
++      Add to cart 🧺
++    </button>
++  );
++}
+diff --git a/components/CartDrawer.jsx b/components/CartDrawer.jsx
+new file mode 100644
+index 0000000..68ddc29
+--- /dev/null
++++ b/components/CartDrawer.jsx
+@@ -0,0 +1,99 @@
++'use client';
++
++import { useEffect } from 'react';
++import Link from 'next/link';
++import { useCart, formatMoney } from '@/lib/CartContext';
++
++export default function CartDrawer() {
++  const { items, subtotal, isOpen, closeCart, setQty, removeItem } = useCart();
++
++  // Close on Escape, lock scroll while open
++  useEffect(() => {
++    if (!isOpen) return;
++    const onKey = (e) => e.key === 'Escape' && closeCart();
++    document.addEventListener('keydown', onKey);
++    document.body.style.overflow = 'hidden';
++    return () => {
++      document.removeEventListener('keydown', onKey);
++      document.body.style.overflow = '';
++    };
++  }, [isOpen, closeCart]);
++
++  return (
++    <>
++      <div
++        className={`cart-overlay ${isOpen ? 'open' : ''}`}
++        onClick={closeCart}
++        aria-hidden="true"
++      />
++      <aside
++        className={`cart-drawer ${isOpen ? 'open' : ''}`}
++        role="dialog"
++        aria-modal="true"
++        aria-label="Shopping cart"
++      >
++        <div className="cart-head">
++          <h2>Your cart 🧺</h2>
++          <button className="cart-close" onClick={closeCart} aria-label="Close cart">
++            ✕
++          </button>
++        </div>
++
++        {items.length === 0 ? (
++          <div className="cart-empty">
++            <span aria-hidden="true">🐾</span>
++            <p>Nothing in here yet — every good groom starts with a click.</p>
++            <button className="btn btn-butter" onClick={closeCart}>
++              Browse services
++            </button>
++          </div>
++        ) : (
++          <>
++            <ul className="cart-items">
++              {items.map((item) => (
++                <li className="cart-item" key={item.id}>
++                  <span className="cart-item-icon" aria-hidden="true">
++                    {item.icon}
++                  </span>
++                  <div className="cart-item-info">
++                    <strong>{item.title}</strong>
++                    <span className="cart-item-price">{formatMoney(item.amount)}</span>
++                    <div className="qty-controls" aria-label={`Quantity of ${item.title}`}>
++                      <button onClick={() => setQty(item.id, item.qty - 1)} aria-label="Decrease quantity">
++                        −
++                      </button>
++                      <span aria-live="polite">{item.qty}</span>
++                      <button onClick={() => setQty(item.id, item.qty + 1)} aria-label="Increase quantity">
++                        +
++                      </button>
++                    </div>
++                  </div>
++                  <div className="cart-item-end">
++                    <span className="cart-line-total">{formatMoney(item.amount * item.qty)}</span>
++                    <button
++                      className="cart-remove"
++                      onClick={() => removeItem(item.id)}
++                      aria-label={`Remove ${item.title} from cart`}
++                    >
++                      Remove
++                    </button>
++                  </div>
++                </li>
++              ))}
++            </ul>
++            <div className="cart-foot">
++              <div className="cart-subtotal">
++                <span>Subtotal</span>
++                <strong>{formatMoney(subtotal)}</strong>
++              </div>
++              <p className="cart-note">Goodbye treat included, as always. 🦴</p>
++              <Link className="btn btn-pink cart-checkout-btn" href="/checkout" onClick={closeCart}>
++                Go to checkout →
++              </Link>
++            </div>
++          </>
++        )}
++      </aside>
++    </>
++  );
++}
+diff --git a/components/Header.jsx b/components/Header.jsx
+index 4af13a8..227df34 100644
+--- a/components/Header.jsx
++++ b/components/Header.jsx
+@@ -1,9 +1,11 @@
+ 'use client';
+ 
+ import { useEffect, useState } from 'react';
++import { useCart } from '@/lib/CartContext';
+ 
+ export default function Header() {
+   const [scrolled, setScrolled] = useState(false);
++  const { count, openCart } = useCart();
+ 
+   useEffect(() => {
+     const onScroll = () => setScrolled(window.scrollY > 24);
+@@ -27,7 +29,13 @@ export default function Header() {
+             <li><a href="#reviews">Reviews</a></li>
+           </ul>
+         </nav>
+-        <a className="btn btn-butter" href="#book">Book a groom</a>
++        <div className="nav-actions">
++          <button className="cart-btn" onClick={openCart} aria-label={`Open cart, ${count} items`}>
++            🧺
++            {count > 0 && <span className="cart-count" aria-hidden="true">{count}</span>}
++          </button>
++          <a className="btn btn-butter" href="#book">Book a groom</a>
++        </div>
+       </div>
+     </header>
+   );
+diff --git a/components/Sections.jsx b/components/Sections.jsx
+index 5861875..89c57af 100644
+--- a/components/Sections.jsx
++++ b/components/Sections.jsx
+@@ -4,6 +4,7 @@ import { useRef } from 'react';
+ import { gsap, useGsap, revealSectionHead } from '@/lib/useGsap';
+ import { MARQUEE_ITEMS, SERVICES, STEPS, TESTIMONIALS } from '@/lib/data';
+ import PetPhoto from './PetPhoto';
++import AddToCartButton from './AddToCartButton';
+ 
+ /* ---------------- Marquee ---------------- */
+ export function Marquee() {
+@@ -56,7 +57,10 @@ export function Services() {
+               <div className="icon" aria-hidden="true">{s.icon}</div>
+               <h3>{s.title}</h3>
+               <p>{s.body}</p>
+-              <span className="price">{s.price}</span>
++              <div className="svc-card-foot">
++                <span className="price">{s.price}</span>
++                <AddToCartButton service={s} />
++              </div>
+             </article>
+           ))}
+         </div>
+diff --git a/lib/CartContext.jsx b/lib/CartContext.jsx
+new file mode 100644
+index 0000000..93f8481
+--- /dev/null
++++ b/lib/CartContext.jsx
+@@ -0,0 +1,89 @@
++'use client';
++
++import { createContext, useContext, useEffect, useMemo, useReducer, useState } from 'react';
++
++const CartContext = createContext(null);
++const STORAGE_KEY = 'suds-cart-v1';
++
++function reducer(state, action) {
++  switch (action.type) {
++    case 'HYDRATE':
++      return action.items;
++    case 'ADD': {
++      const existing = state.find((i) => i.id === action.item.id);
++      if (existing) {
++        return state.map((i) =>
++          i.id === action.item.id ? { ...i, qty: Math.min(i.qty + 1, 20) } : i
++        );
++      }
++      return [...state, { ...action.item, qty: 1 }];
++    }
++    case 'SET_QTY': {
++      if (action.qty <= 0) return state.filter((i) => i.id !== action.id);
++      return state.map((i) => (i.id === action.id ? { ...i, qty: Math.min(action.qty, 20) } : i));
++    }
++    case 'REMOVE':
++      return state.filter((i) => i.id !== action.id);
++    case 'CLEAR':
++      return [];
++    default:
++      return state;
++  }
++}
++
++export function CartProvider({ children }) {
++  const [items, dispatch] = useReducer(reducer, []);
++  const [isOpen, setIsOpen] = useState(false);
++  const [hydrated, setHydrated] = useState(false);
++
++  // Load persisted cart on mount
++  useEffect(() => {
++    try {
++      const raw = window.localStorage.getItem(STORAGE_KEY);
++      if (raw) dispatch({ type: 'HYDRATE', items: JSON.parse(raw) });
++    } catch {
++      /* corrupted storage — start fresh */
++    }
++    setHydrated(true);
++  }, []);
++
++  // Persist on change (after hydration, so we don't wipe the stored cart)
++  useEffect(() => {
++    if (!hydrated) return;
++    try {
++      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
++    } catch {
++      /* storage unavailable */
++    }
++  }, [items, hydrated]);
++
++  const value = useMemo(() => {
++    const count = items.reduce((n, i) => n + i.qty, 0);
++    const subtotal = items.reduce((n, i) => n + i.amount * i.qty, 0);
++    return {
++      items,
++      count,
++      subtotal,
++      isOpen,
++      openCart: () => setIsOpen(true),
++      closeCart: () => setIsOpen(false),
++      addItem: (item) => {
++        dispatch({ type: 'ADD', item });
++        setIsOpen(true);
++      },
++      setQty: (id, qty) => dispatch({ type: 'SET_QTY', id, qty }),
++      removeItem: (id) => dispatch({ type: 'REMOVE', id }),
++      clearCart: () => dispatch({ type: 'CLEAR' }),
++    };
++  }, [items, isOpen]);
++
++  return <CartContext.Provider value={value}>{children}</CartContext.Provider>;
++}
++
++export function useCart() {
++  const ctx = useContext(CartContext);
++  if (!ctx) throw new Error('useCart must be used inside <CartProvider>');
++  return ctx;
++}
++
++export const formatMoney = (n) => `$${n.toFixed(2)}`;
+diff --git a/lib/data.js b/lib/data.js
+index ce7cf07..ab37453 100644
+--- a/lib/data.js
++++ b/lib/data.js
+@@ -3,6 +3,8 @@ const unsplash = (id, w = 640) =>
+ 
+ export const SERVICES = [
+   {
++    id: 'bath-brush',
++    amount: 35,
+     color: 'c-butter',
+     icon: '🛁',
+     title: 'Bath & Brush',
+@@ -11,6 +13,8 @@ export const SERVICES = [
+   },
+   {
+     color: 'c-pink',
++    id: 'full-groom',
++    amount: 65,
+     icon: '✂️',
+     title: 'Full Groom',
+     body: 'The works: bath, breed-standard or freestyle haircut, nails, ears and a bandana of their choosing.',
+@@ -18,6 +22,8 @@ export const SERVICES = [
+   },
+   {
+     color: 'c-teal',
++    id: 'de-shed',
++    amount: 45,
+     icon: '🫧',
+     title: 'De-shed Treatment',
+     body: 'Undercoat rescue mission for the fluff-storms. Reduces shedding up to 80% — your couch says thanks.',
+@@ -25,6 +31,8 @@ export const SERVICES = [
+   },
+   {
+     color: 'c-lav',
++    id: 'nail-spa',
++    amount: 15,
+     icon: '💅',
+     title: 'Nail Spa',
+     body: "Trim, grind and buff. Gentle handling for the dramatic ones — we've seen it all, no judgement.",
+@@ -32,6 +40,8 @@ export const SERVICES = [
+   },
+   {
+     color: 'c-sky',
++    id: 'cat-grooming',
++    amount: 55,
+     icon: '🐈',
+     title: 'Cat Grooming',
+     body: 'Calm rooms, quiet dryers and a certified cat groomer. Lion cuts available for the bold.',
+@@ -39,6 +49,8 @@ export const SERVICES = [
+   },
+   {
+     color: 'c-tang',
++    id: 'teeth-ears',
++    amount: 12,
+     icon: '🦷',
+     title: 'Teeth & Ears',
+     body: 'Fresh-breath brushing and gentle ear cleaning. Add on to any service for a head-to-tail refresh.',
+diff --git a/package-lock.json b/package-lock.json
+index 6531438..d1bfb9d 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -11,7 +11,8 @@
+         "gsap": "^3.12.7",
+         "next": "^15.1.6",
+         "react": "^19.0.0",
+-        "react-dom": "^19.0.0"
++        "react-dom": "^19.0.0",
++        "stripe": "^22.3.1"
+       }
+     },
+     "node_modules/@emnapi/runtime": {
+@@ -784,7 +785,6 @@
+       "resolved": "https://registry.npmjs.org/react/-/react-19.2.7.tgz",
+       "integrity": "sha512-HNe9WslTbXmFK8o8cmwgAeJFSBvt1bPdHCVKtaaV+WlAN36mpT4hcRpwbf3fY56ar2oIXzsBpOAiIRHAdY0OlQ==",
+       "license": "MIT",
+-      "peer": true,
+       "engines": {
+         "node": ">=0.10.0"
+       }
+@@ -794,7 +794,6 @@
+       "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.2.7.tgz",
+       "integrity": "sha512-t0BRVXvbiE/o20Hfw669rLbMCDWtYZLvmJigy2f0MxsXF+71pxhR3xOkspmsO8h3ZlNzyibAmtCa3l4lYKk6gQ==",
+       "license": "MIT",
+-      "peer": true,
+       "dependencies": {
+         "scheduler": "^0.27.0"
+       },
+@@ -875,6 +874,23 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/stripe": {
++      "version": "22.3.1",
++      "resolved": "https://registry.npmjs.org/stripe/-/stripe-22.3.1.tgz",
++      "integrity": "sha512-6XSLN0KK0IdfXqDHqMg6CDoO3eO62ye9dhzw0fZp55AUOzHR1YRJOqYHTsuCi4QJ4Ni/usEmXtq69c9ghKDmYw==",
++      "license": "MIT",
++      "engines": {
++        "node": ">=18"
++      },
++      "peerDependencies": {
++        "@types/node": ">=18"
++      },
++      "peerDependenciesMeta": {
++        "@types/node": {
++          "optional": true
++        }
++      }
++    },
+     "node_modules/styled-jsx": {
+       "version": "5.1.6",
+       "resolved": "https://registry.npmjs.org/styled-jsx/-/styled-jsx-5.1.6.tgz",
+diff --git a/package.json b/package.json
+index 3722005..7d3eae3 100644
+--- a/package.json
++++ b/package.json
+@@ -11,6 +11,7 @@
+     "gsap": "^3.12.7",
+     "next": "^15.1.6",
+     "react": "^19.0.0",
+-    "react-dom": "^19.0.0"
++    "react-dom": "^19.0.0",
++    "stripe": "^22.3.1"
+   }
+ }
+-- 
+2.43.0
+

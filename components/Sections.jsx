@@ -4,6 +4,7 @@ import { useRef } from 'react';
 import { gsap, useGsap, revealSectionHead } from '@/lib/useGsap';
 import { MARQUEE_ITEMS, SERVICES, STEPS, TESTIMONIALS } from '@/lib/data';
 import PetPhoto from './PetPhoto';
+import AddToCartButton from './AddToCartButton';
 
 /* ---------------- Marquee ---------------- */
 export function Marquee() {
@@ -56,7 +57,10 @@ export function Services() {
               <div className="icon" aria-hidden="true">{s.icon}</div>
               <h3>{s.title}</h3>
               <p>{s.body}</p>
-              <span className="price">{s.price}</span>
+              <div className="svc-card-foot">
+                <span className="price">{s.price}</span>
+                <AddToCartButton service={s} />
+              </div>
             </article>
           ))}
         </div>
